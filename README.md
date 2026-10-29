@@ -1,604 +1,329 @@
-# HG680P Unbrick Guide
-### Fiberhome HG680P · Amlogic S905X (GXL) · Secure Boot
+# HG680P Unbrick — Secure-Boot Edition
 
-[![Status](https://img.shields.io/badge/status-verified%20working-brightgreen)](#)
-[![SoC](https://img.shields.io/badge/SoC-Amlogic%20S905X-blue)](#)
-[![Boot](https://img.shields.io/badge/secure%20boot-ON-red)](#)
-[![Tool](https://img.shields.io/badge/tool-USB%20Burning%20Tool%20v2.x-orange)](#)
+![status](https://img.shields.io/badge/status-verified%20working-brightgreen)
+![SoC](https://img.shields.io/badge/SoC-Amlogic%20S905X-blue)
+![secure boot](https://img.shields.io/badge/secure%20boot-ON-red)
+![tool](https://img.shields.io/badge/tool-USB%20Burning%20Tool%20v2.x-orange)
 
-> **tl;dr** — The Amlogic USB Burning Tool erased the bootloader partition and couldn't write it back.  
-> Getting it back requires **two specific files**: the DDR blob from the 3F repo (community DDR.USB files are missing a critical struct) and the UBOOT_ENC.USB from stock HG680P firmware (generic builds don't have the security chip signing this board expects).  
-> Use **v2.x only** — v3 does not work for this.
+Recovery guide for the **Fiberhome HG680P** (IndiHome STB, Amlogic **S905X / GXL**, 2 GB) when it's stuck in **mask ROM / "WorldCup Device"** mode, and the Amlogic USB Burning Tool keeps failing at **1–2%** (DDR init) or **4%** (u-boot hand-off).
 
----
+The usual "load the .img into USB Burning Tool and press Start" guides don't work on units with **secure boot fused on**. This repo explains why and gives a fix that works: **a one-script patch to the stock firmware image**. You don't need vendor keys, UART or a soldering iron.
 
-## Table of Contents
-
-1. [Device Info](#1-device-info)
-2. [How It Got Bricked — Root Cause](#2-how-it-got-bricked--root-cause)
-3. [Boot Chain Primer](#3-boot-chain-primer-s905x--gxl)
-4. [WorldCup / IPL Mode](#4-what-the-worldcup--ipl-mode-means)
-5. [What Was Still Intact on the eMMC](#5-what-was-still-intact-on-the-emmc)
-6. [PATH A — pyamlboot (Closed for Secure-Boot Devices)](#6-path-a--manual--pyamlboot-closed-for-secure-boot-devices)
-7. [PATH B — Official Burning Tool (What Worked)](#7-path-b--official-amlogic-usb-burning-tool-what-actually-worked)
-8. [Bug 1 — ddrpara Struct Missing at 0x9800](#8-bug-1--ddrpara-struct-missing-at-0x9800-in-community-ddrusb)
-9. [Bug 2 — Wrong UBOOT_ENC.USB](#9-bug-2--wrong-uboot_encusb-generic-vs-security-chip-signed)
-10. [**The Final Working Procedure**](#10-the-final-working-procedure)
-11. [Things That Were Tried and Failed](#11-things-that-were-tried-and-failed)
-12. [Key Evidence From Logs](#12-key-evidence-from-logs)
-13. [Tools and Resources](#13-tools-and-resources)
-14. [For Developers / Researchers](#14-for-developers--researchers)
-- [Appendix: Error Code Quick Reference](#appendix-quick-reference-error-codes)
+> **Status:** ✅ Recovered on a real unit (bricked 2026-10-20, burned to 100% on 2026-10-23 at 00:23 WIB).
+> Tested on **one** HG680P. Other units, or other S905X boxes, may differ. Read the whole thing before you burn anything.
 
 ---
 
-## 1. Device Info
+## TL;DR
 
-| Field | Value |
-|---|---|
-| Model | Fiberhome HG680P |
-| SoC | Amlogic S905X (GXL family) |
-| RAM | 2 GB LPDDR3 |
-| Storage | eMMC (internal) |
-| OS | Android TV 9 |
-| USB VID:PID (WorldCup mode) | `1b8e:c003` |
-| Secure boot efuse | `0xc8100228 = 0xbdfd21bc` (bit 0x10 set → **secure boot is ON**) |
+Everything before 4% is the **DDR-init stage** (`Romcode/Initialize DDR/...`), and it can die at 1% or 2%. Go by the error code, not the percentage:
 
-**Related models:** B860H shares a similar hardware platform and some of the same firmware files apply. The 3F repo's files target S905X generically.
-
----
-
-## 2. How It Got Bricked — Root Cause
-
-On **2026-10-05 at 22:07:05**, the Amlogic USB Burning Tool was used to flash a custom ROM. The tool's first action is always `ERASE BOOTLOADER`. The `bootloader` partition is the first 4 MiB of eMMC, starting at offset 0x0.
-
-The tool logged:
-```
-[22:07:05][HUB2-2][Inf]--ERASE BOOTLOADER
-```
-
-Then the USB burn stalled and timed out before writing the new bootloader. The 4 MiB was wiped. Nothing was written back.
-
-**From that point on, the mask ROM found no valid BL2 → the box enumerated in WorldCup mode (stage `2-4-0-0`) on every power-on.**
-
-Everything else on the eMMC survived:
-- ROM MPT @ 0x2400000
-- System, vendor, odm, product, vbmeta, dtbo, recovery partitions — all intact
-- Boot image @ 0x59600000
-- DTB store @ 0x2800000
-
-The *only* missing piece was the 4 MiB boot area at eMMC offset 0x0.
-
-### Pre-brick boot area layout (`bootarea_before.bin`)
-```
-md5:  9c9362c0507e1cb2bcf383b83ec83ba0
-size: 4 MiB (0x400000)
-
-0x000000–0x0CBFFF  vendor u-boot (@AML container, encrypted, signed)
-0x0CC000–0x0CFF3F  16 KB gap (zeros)
-0x0CFF40–0x0ECF3F  AML_ multi-DTB store
-0x0ECF40–0x1B92FB  aml_sdc_burn u-boot + ini + boot.img prefix
-```
-
----
-
-## 3. Boot Chain Primer (S905X / GXL)
-
-Understanding this chain is essential for any recovery attempt:
-
-```
-Power on
-  └─ Mask ROM (hardcoded in silicon, cannot be erased)
-       └─ Reads eMMC @ 0x0 → looks for valid BL2 (@AML container)
-            └─ BL2 = DDR init stage (ddrpara struct → trains DRAM)
-                 └─ BL33 = U-Boot proper (main bootloader)
-                      └─ Android / Armbian
-```
-
-**In WorldCup mode** the mask ROM has found no valid BL2 on eMMC, so it waits on USB for a host to push BL2 over the wire. This is the recovery entry point.
-
-**The @AML container format:**
-```
-Offset  Content
-0x00    16-byte SHA2 hash (of what follows)
-0x10    "@AML" magic bytes
-0x14    Header fields (size, version, etc.)
-0x1000  Executable code starts here  ← CRITICAL: entry point is +0x1000, NOT 0x0
-```
-
-**ddrpara struct** at offset `0x9800` inside the DDR.USB blob: the DRAM config table the BL2 code reads before training the memory. Without it, DDR init fails regardless of everything else.
-
----
-
-## 4. What the WorldCup / IPL Mode Means
-
-When the box is in WorldCup mode:
-- USB enumerates as `VID 1b8e PID c003`
-- The Amlogic Burning Tool detects it as stage `2-4-0-0`
-- The mask ROM is waiting to receive `DDR.USB` (or `DDR_ENC.USB` on secure-boot devices) over USB
-- Once DDR is initialized, it waits for `UBOOT_ENC.USB` (the main bootloader)
-- Once U-Boot is running, the tool proceeds with normal partition flashing
-
-If either step fails, the box stays in WorldCup mode indefinitely.
-
----
-
-## 5. What Was Still Intact on the eMMC
-
-```
-factory MPT (15 entries, crc 0xb803c1fd):
-  p1  bootloader   size 0x00400000  off 0x000000000  ← THIS WAS ERASED
-  p2  reserved     size 0x04000000  off 0x002000000
-  ...
-
-ROM MPT (20 entries, crc 0xf55a57fc):
-  p1  bootloader   size 0x00400000  off 0x000000000  ← SAME
-  p18 system       off 0x7A600000
-```
-
-**Only the first 4 MiB was gone.** If you have a backup, restoring it is trivial once you have a running U-Boot. If you don't, you need the files from the right sources (see [Section 10](#10-the-final-working-procedure)).
-
----
-
-## 6. PATH A — Manual / pyamlboot (Closed for Secure-Boot Devices)
-
-This path was explored thoroughly and **does not work** on secure-boot HG680P units. Documented here so you don't waste the same weeks.
-
-### What PATH A attempts
-
-Use open-source tools (pyamlboot, optimus.py, or custom Python scripts) to manually push the DDR.USB blob over USB and initialize DRAM without the official tool.
-
-### Bug A1 — Wrong entry point in all known tools
-
-Every open-source tool jumps to address `0xd9000000` to run the DDR blob. But `0xd9000000` is the **@AML container header** — 16 bytes of SHA hash followed by `@AML`. That is not executable code.
-
-The real entry point is `0xd9000000 + 0x1000`.
-
-```
-run at 0xd9000000  → CPU executes the 16-byte container header as instructions → dies
-paraMagic remains = our sent value (never updated by ROM)  → no ack
-
-run at 0xd9001000  → SPL starts, reads para, writes 8-word hash-of-para response
-                   → DRAM training begins but fails
-                   → No DDR ack (paraMagic never becomes 0x7856efab)
-```
-
-The corrected entry point gets further — but still hits the secure-boot wall below.
-
-### Bug A2 — Wrong run-para format
-
-The genuine Amlogic run-para is **8 words / 32 bytes**:
-```
-3412cdab 00000200 0000c0df 00000001 00400000 0082c0cc 00000000 00000010
-```
-
-Known broken implementations:
-- `pyamlboot` / `optimus.py` stock: only writes 6 words, zeroes the rest
-- Radxa copy of pyamlboot: last two words **swapped** — sends `10000000 00000000` instead of `00000000 00000010`
-
-### The secure-boot wall (cannot be bypassed)
-
-```
-0xc8100228 = 0xbdfd21bc
-bit 0x10 is set → secure boot ENABLED
-```
-
-When secure boot is set, the mask ROM requires a **vendor-encrypted and vendor-signed** `DDR_ENC.USB`. The signing keys are Amlogic's private secrets — not in the tool install, not in any community ROM, cannot be extracted or forged.
-
-**Full sweep performed, never acked:**
-- 3 different BL2 blobs (community / stock / 3F reference)
-- 2 para layouts, 12 different DRAM size/cmd word values
-- 8 run addresses (base, +0x10, +0x40, +0x1000, ddr_set_addr variants)
-- 4 para placements in memory
-- para-first vs blob-first ordering
-- 32-byte vs 0x200-byte para writes, 64-byte vs 0x1000-byte USB transfers
-- response-echo experiments, AMLC FIP polling
-
-**If your box has bit 0x10 set at `0xc8100228`, PATH A is closed. Use PATH B.**
-
----
-
-## 7. PATH B — Official Amlogic USB Burning Tool (What Actually Worked)
-
-The official tool (v2.x — **not v3**) takes a secure-boot branch when it reads the efuse and switches to `DDR_ENC.USB`. When fed the right files, it works.
-
-**The two files that must be correct:**
-
-| File | Wrong source | Right source |
+| Symptom in USB Burning Tool log | Cause | Fix |
 |---|---|---|
-| `DDR_ENC.USB` | Any community build whose source `DDR.USB` has zeros or garbage at 0x9800 | Built from `github.com/3F/aml_s905_uboot` DDR.USB (has valid ddrpara) |
-| `UBOOT_ENC.USB` | Generic community U-Boot (missing security chip signing) | Extracted from stock HG680P firmware, or X96 firmware from the same security chip variant |
+| Fails at **1–2%**: `Download DDR_ENC.USB,size: 0!` → `[0x10103005] Read item data failed` | Chip has secure boot, so the tool asks for `USB/DDR_ENC` + `USB/UBOOT_ENC`. The stock image doesn't have them. | Run [`make_secure_image.py`](make_secure_image.py) on the stock image |
+| Fails at **1–2%**: `paraMagic:0x3412cdab` / `[0x10105002] ReadPara failed` | DDR init never ran: the BL2 you supplied was rejected (it's plaintext or for another board) | Use the encrypted BL2 from the stock `PARTITION/bootloader` (the script does this) |
+| Fails at **1–2%**: `[0x10103003] USB transfer error` (`usbWriteFile ... ret=-116`), or `[0x10105004]` / `[0x10102002]` | DDR blob didn't reach the chip, or init failed on a bad attempt. Happens even with the right image. | Unplug the box's power for 5 s, retry. Close other USB tools, try another port. The working burn failed this way six times before passing. |
+| Passes DDR (`paraMagic:0x7856efab`, `ddrCapacity:0x800`), then fails at **4%**: `Detect Device remove timeout` → `[0x10303004] Switch status/Identify/Error` | BL2 and u-boot are **not a matched pair**, so u-boot never starts | Use the u-boot that belongs to that BL2. It's the rest of the same `PARTITION/bootloader` blob (the script does this) |
 
-Both bugs are described in detail below. Fix both — neither alone is sufficient.
+**The key idea:** the stock firmware's `PARTITION/bootloader` item (1,146,880 bytes) already contains the vendor-signed pair this chip accepts:
+
+```
+PARTITION/bootloader
+├── [0x00000 – 0x0BFFF]  49,152 B     encrypted BL2   → goes into USB/DDR + USB/DDR_ENC
+└── [0x0C000 – end    ]  1,097,728 B  matching u-boot → goes into USB/UBOOT + USB/UBOOT_ENC
+```
+
+The stock image just never exposes that pair to the tool's secure-boot path. Split it into the `_ENC` slots and the burn goes to 100%.
 
 ---
 
-## 8. Bug 1 — ddrpara Struct Missing at 0x9800 in Community DDR.USB
+## Contents
 
-**This is the root cause of DDR init failure on PATH B.**
+- [Device info](#device-info)
+- [Are you in the same situation?](#are-you-in-the-same-situation)
+- [Working procedure](#working-procedure)
+- [After it boots](#after-it-boots)
+- [Why it fails: how the USB burn works](#why-it-fails-how-the-usb-burn-works)
+- [Error code cheat sheet](#error-code-cheat-sheet)
+- [Bonus: get Armbian/SSH back with a dead eMMC](#bonus-get-armbianssh-back-with-a-dead-emmc)
+- [What was tried and ruled out](#what-was-tried-and-ruled-out)
+- [How this unit got bricked](#how-this-unit-got-bricked)
+- [Resources & credits](#resources--credits)
 
-At offset `0x9800` inside the DDR.USB blob lives a struct called `ddrpara`. It contains DRAM configuration — timing parameters, width, rank, capacity — that BL2 reads before training the memory. Without a valid struct, DDR init fails silently.
+---
 
-### What's at 0x9800 in different DDR.USB files
+## Device info
 
-| Source | 0x9800 contents |
+| | |
 |---|---|
-| "Aidan" community DDR.USB | Build string `xl 3e531ea - luan.yuan` — stomped over 0x9800 |
-| Stock/OEM DDR.USB | All zeros |
-| 3F/aml_s905_uboot DDR.USB | ✅ Correct struct: `03 02 01 00 01 03 02 00 ...` |
-
-### How to check
-
-> ⚠️ Check the **unencrypted `DDR.USB`**, not `DDR_ENC.USB`. The encrypted blob's 0x9800 region is ciphertext — it won't be readable plaintext. Verify the source file before it gets packaged into your image.
-
-```python
-with open('DDR.USB', 'rb') as f:
-    f.seek(0x9800)
-    data = f.read(16)
-    print(data.hex())
-
-# ✅ Good:  03020100 01030200 ...
-# ❌ Bad:   00000000 00000000 00000000 00000000
-# ❌ Bad:   786c2033 65353331 65612020 2d206c75  ("xl 3e531ea - lu")
-```
-
-### Fix
-
-Get `DDR.USB` from **https://github.com/3F/aml_s905_uboot**
-
-> ⚠️ **Pin to a specific commit.** The ddrpara contents can change between commits and the 0x9800 validation depends on the version that worked here.
-
-### What successful DDR init looks like
-
-```
-[HUB2-2][Inf]--Download DDR.USB
-[HUB2-2][Inf]--Control write pll reg1 0xd9000000:0x000000b1
-[HUB2-2][Inf]--Control write pll reg1 0xd9000000:0x00005183
-(×2 more pll writes)
-[HUB2-2][Inf]--Write initial succeed
-[HUB2-2][Inf]--Upload encrypt at 0xc8100228
-[HUB2-2][Inf]--ulValue = 0xbdfd21bc
-[HUB2-2][Inf]--File change to DDR_ENC.USB
-[HUB2-2][Inf]--Read encrypt value succeed
-```
-
-Then DDR init acks with paraMagic `0x7856efab`, ddrCapacity `0x800` (= 2 GB detected).
+| Board | Fiberhome HG680P, DTB `gxl_p212_2gs` |
+| SoC | Amlogic S905X (GXL) |
+| RAM | 2 GB (`ddrCapacity:0x800`) |
+| Storage | 8 GB eMMC (`8GTF4R`, appears as `/dev/mmcblk2` under Armbian) |
+| Secure boot | **Enabled.** Reg `0xc8100228` reads `0xbdfd21bc` (bit `0x10` set). The tool logs `File change to DDR_ENC.USB`. |
+| Mask ROM USB ID | `VID_1B8E&PID_C003`, shown as **"WorldCup Device"** or **"GX-CHIP"** |
+| Mask ROM identify | `2-4-0-0` (IPL). A running u-boot identifies as `0-7-0-16` (TPL). |
+| Stock firmware | atvXperience-based Android **6.0.1** (SDK 23), pre-rooted with SuperSU |
 
 ---
 
-## 9. Bug 2 — Wrong UBOOT_ENC.USB (Generic vs Security-Chip-Signed)
+## Are you in the same situation?
 
-After DDR init succeeds, the tool pushes `UBOOT_ENC.USB` to `0x200c000`. If the device never re-enumerates as ADFU (Amlogic Download Firmware Update), U-Boot crashed.
+This guide is for you if **all** of these are true:
 
-**Symptom:**
-```
-Download UBOOT_ENC.USB → 0x200c000 ✓
-DownCheckPara succeed
-ReadCheckPara succeed
-DownRunPara succeed
-Run at 0xd9000000
-... (12 seconds pass) ...
-Detect Device remove timeout
-[0x10303004] Switch status/Identify/Error
-```
+1. The box shows nothing on HDMI and enumerates on the PC as **WorldCup Device / GX-CHIP**.
+2. The USB Burning Tool log shows `ulValue = 0xbdfd21bc` and/or `File change to DDR_ENC.USB`. That line means secure boot is on.
+3. Burning the stock/YouTube image fails during DDR init (**1–2%**) with `[0x10103005]` or `[0x10105002]`, or your custom image gets past DDR and fails at **4%** with `[0x10303004]`.
 
-The HG680P has a **security chip** that signs communication with U-Boot. A generic UBOOT_ENC.USB doesn't have the matching signing this board expects — U-Boot panics before USB init.
+If the tool logs show `ulValue = 0x00000000` and takes the plain `Download DDR.USB` path, your chip isn't in secure mode. A normal burn guide should work for you.
 
-### Fix
-
-Extract `UBOOT_ENC.USB` from the **stock HG680P firmware** (`ATV FW HG680P.img`). Stock firmware for compatible devices (X96 and similar S905X boards that share the same security chip variant) also works.
-
-Open the stock `.img` in the Amlogic USB Burning Tool or a hex editor — look for the `UBOOT_ENC.USB` partition item, or extract from the `items/` directory if the firmware is unpacked.
-
-**After switching to the stock HG680P UBOOT_ENC.USB, U-Boot came up, USB re-enumerated as ADFU, and the burn completed normally.**
+The tool's logs are in:
+`C:\Program Files (x86)\Amlogic\USB_Burning_Tool\log\<YYYY.MM>\<YYYY.MM.DD>\`
 
 ---
 
-## 10. The Final Working Procedure
+## Working procedure
 
-### Prerequisites
+### What you need
 
-- Windows PC with **Amlogic USB Burning Tool v2.x** (v3 does not work)
-- A firmware `.img` you want to flash
-- Correct `DDR_ENC.USB` — built from `3F/aml_s905_uboot` DDR.USB
-- Correct `UBOOT_ENC.USB` — from stock HG680P firmware, or X96 from the same security chip variant
-- USB Type-A to Type-A cable (or USB-A to micro/USB-C depending on your HG680P variant)
-- Optional: toothpick/paperclip for the recovery pinhole (inside the AV jack on some units)
+- Windows PC with **Amlogic USB Burning Tool v2.1.6.8** (the version in the *"ATV FW HG680P USB Burning V2.1"* package). v2.1.6 and v2.2.0 use the same secure-boot logic, so the tool version doesn't fix this.
+- The stock firmware **`ATV FW HG680P.img`**, from the same *"ATV FW HG680P USB Burning V2.1"* package. This repo does not host firmware.
+- Python 3 (standard library only).
+- USB A-to-A cable to the box's OTG port, plus the **12 V DC adapter**.
 
-### Step 1 — Verify your DDR.USB at 0x9800
+> ⚠️ **About the stock firmware:** it is pre-rooted, and an init script (`init.fhservice.sh`) starts an **unauthenticated root telnet shell on port 23** (`busybox telnetd -l /system/bin/sh &`). It also includes FTP/TFTP/telemetry-upload scripts. It contains no malware as such, but anyone on your LAN can get a root shell. See [After it boots](#after-it-boots) to close it.
 
-Check offset `0x9800` in the hex editor or the Python snippet above. Must not be all zeros or a build string. If wrong, replace with the 3F repo version.
+### Step 1: Build the patched image
 
-### Step 2 — Prepare your firmware image
-
-Replace the `DDR_ENC.USB` and `UBOOT_ENC.USB` items in your burn image with the verified files. For directory-format (unpacked) firmware, overwrite the two files in `items/`.
-
-**Important:** The normal burn image only writes 835,584 bytes for the bootloader partition, but the partition is 4 MiB. The DTB store at 0x0CFF40 is also inside the bootloader partition — if you only write the u-boot portion, the DTB store is lost and the box won't find its device tree. Make sure your image covers the full 4 MiB if you want a proper restore.
-
-```
-0x000000–0x0CBFFF  vendor u-boot (@AML encrypted, 835,584 bytes)
-0x0CC000–0x0CFF3F  gap (zeros)
-0x0CFF40–0x0ECF3F  AML_ multi-DTB store
-0x0ECF40+          aml_sdc_burn + boot.img prefix
+```bash
+python make_secure_image.py "ATV FW HG680P.img" hg680p_secure.img
 ```
 
-### Step 3 — Enter WorldCup mode
+Optional: add a custom boot splash (raw Amlogic logo partition blob). `VERIFY/logo` is regenerated for you:
 
-The box is already in WorldCup mode if bricked the same way. Connect via USB. Should enumerate as `USB\VID_1B8E&PID_C003`.
-
-If it doesn't enumerate:
-- Hold the recovery pinhole button while connecting power
-- Some units: hold reset button while plugging in USB
-
-### Step 4 — Launch the tool and start the burn
-
-Open the tool — it should detect `2-4-0-0`. Load your image, click Start.
-
-Watch for:
-```
-File change to DDR_ENC.USB    ← secure boot detected, switched to encrypted blob
-Read encrypt value succeed
-Write initial succeed
+```bash
+python make_secure_image.py "ATV FW HG680P.img" hg680p_secure.img --logo my_logo.bin
 ```
 
-If DDR init fails → `DDR_ENC.USB` is still wrong.
+Expected output: 16 items in, **18 items out**. `USB/DDR` and `USB/DDR_ENC` should both be the same 49,152-byte blob, and `USB/UBOOT` and `USB/UBOOT_ENC` the same 1,097,728-byte blob.
 
-### Step 5 — Wait for U-Boot handoff
+Reference values from the working build:
 
-```
-Download UBOOT_ENC.USB → 0x200c000  [OK]
-DownCheckPara succeed
-```
-
-The device should disconnect and reconnect as ADFU. If it times out → `UBOOT_ENC.USB` is wrong.
-
-### Step 6 — Burn completes
-
-Once ADFU is active, all partitions flash normally. Bootloader partition gets the full 4 MiB.
-
-### Step 7 — Power cycle and boot
-
-The box should boot into Android TV. If it boots but something is wrong, check the DTB store at eMMC offset 0x2800000 (the `dtb` partition).
-
----
-
-## 11. Things That Were Tried and Failed
-
-### SD card — Layout A (wrong offset)
-**Tried:** Write the 4 MiB boot area to SD at offset 0x0.  
-**Result:** Still `2-4-0-0`.  
-**Why:** S905X needs the bootloader at SD offset **0x200** (sector 1, not 0x0). Offset 0x0 is the MBR — overwriting it also breaks the SD card's own boot.  
-**Note:** The 3F repo documents this: *"s905 bootloader will be stored with 0-offset in emmc (s905x +512 bytes)"*.
-
-### SD card — Layout B (correct offset, still failed)
-**Tried:** Bootloader at SD 0x200, MBR preserved, DTB store at correct gap offset.  
-**Result:** Still didn't boot from SD.  
-**Why:** This unit appears to prioritize eMMC over SD in the mask ROM. eMMC CLK isolation (shorting pin 29/30) would force SD boot, but wasn't attempted.
-
-### pyamlboot with corrected entry point
-**Tried:** Modified pyamlboot to jump to 0xd9001000.  
-**Result:** SPL started and read the para. ROM produced a hash-of-para response. DRAM never came up.  
-**Why:** Secure boot requires vendor-encrypted BL2. The ROM's para-check step refuses without the correct keys.
-
-### Community/Aidan DDR.USB with official tool
-**Tried:** Community DDR.USB files on the secure-boot path.  
-**Result:** `ReadPara failed [0x10105002]`.  
-**Why:** ddrpara at 0x9800 is missing or corrupted.
-
-### USB transport error `0x10103003` / `usbWriteFile` timeout
-
-> ⚠️ This is a **distinct failure mode** from DDR init failure — commonly confused because the error code overlaps.
-
-**Symptom:**
-```
-usbWriteFile len=4096,ret=-116 error_msg=libusb0-dll:err [_usb_reap_async] timeout error
-```
-or `ret=-5 [device not functioning]`
-
-The burn fails immediately at 0%, before DDR init even starts. **The blob never transferred. This is a USB transport problem on the host side, not a firmware problem.**
-
-**Root cause:** Parsec virtual USB adapter (or any USB-over-network/virtualization software) intercepting libusb. Also: bad cable, USB hub, or power glitch.
-
-**Fix:**
-1. Power cycle the box (5 seconds off)
-2. Unplug and replug the USB cable
-3. If using Parsec or any USB virtualization software — **bypass it entirely**, use a direct USB port
-4. Try a different USB port (USB 2.0, directly on the motherboard, no hub)
-5. Retry
-
-`0x10103003` has two distinct meanings:
-- `Need_Write=4096, Actual_Write=0` → **USB transport failure** (fix above)
-- Same code but after blob transfer → **secure-boot plain-path rejection** (ROM refuses unsigned DDR.USB)
-
-### Generic UBOOT_ENC.USB after correct DDR init
-**Tried:** DDR from 3F repo (correct), UBOOT_ENC.USB from generic community source.  
-**Result:** Tool uploaded U-Boot, told it to run, then 12-second timeout → `[0x10303004]`. Device never re-enumerated as ADFU.  
-**Why:** Generic U-Boot lacks security chip signing → crashes before USB init.
-
-### eMMC CLK isolation
-**Not attempted** — requires opening the box and identifying eMMC pins. A valid recovery path if all USB approaches fail.
-
----
-
-## 12. Key Evidence From Logs
-
-### Secure boot detection
-```
-[HUB2-2][Inf]--Upload encrypt at 0xc8100228
-[HUB2-2][Inf]--ulValue = 0xbdfd21bc
-[HUB2-2][Inf]--File change to DDR_ENC.USB
-```
-`0xbdfd21bc` with bit `0x10` set = secure boot enabled. Tool correctly switches to the encrypted DDR path.
-
-### DDR init failure (bad DDR.USB)
-```
-[HUB2-2][Err]--Download file failed, sequence 0
-[HUB2-2][Err]--usbWriteFile len=4096,ret=-116 error_msg=libusb0-dll:err [_usb_reap_async] timeout error
-```
-or: `ReadPara failed [0x10105002]`
-
-### Successful DDR init
-- Sent para with magic `0x3412cdab`
-- ROM responds with magic `0x7856efab` ← **DDR init success**
-- `ddrCapacity: 0x800` ← 2 GB detected correctly
-
-### U-Boot handoff failure (wrong UBOOT_ENC.USB)
-```
-Download UBOOT_ENC.USB → 0x200c000 ✓
-DownCheckPara succeed
-ReadCheckPara succeed
-DownRunPara succeed
-Run at 0xd9000000
-[... 12 seconds ...]
-Detect Device remove timeout
-[0x10303004] Switch status/Identify/Error
-```
-
-### USB transport failure (Parsec)
-```
-usbWriteFile len=4096,ret=-116 error_msg=libusb0-dll:err [_usb_reap_async] timeout error
-usbWriteFile len=4096,ret=-5 [device not functioning]
-```
-These appeared on 2026-10-22 at 20:55–20:57 after DDR init had already been proven working. Root cause: Parsec virtual USB adapter. Fixed by power cycling and connecting directly.
-
-### Bricking event (2026-10-05)
-```
-[22:07:05][HUB2-2][Inf]--ERASE BOOTLOADER
-[22:07:05 ...][HUB2-2][Err]--USB timeout
-```
-
----
-
-## 13. Tools and Resources
-
-### Critical repos
-
-| Resource | URL | Notes |
+| Item | Size | sha256 (first 8) |
 |---|---|---|
-| **3F/aml_s905_uboot** | https://github.com/3F/aml_s905_uboot | DDR.USB with correct ddrpara @ 0x9800, `aml_encrypt_gxl`, S905X recovery docs. ⚠️ Pin to a specific commit — ddrpara can change between commits. |
-| **FarelRA/HG680P-B860H-Files** | https://github.com/FarelRA/HG680P-B860H-Files | Stock firmware, ROM files, partition layouts for HG680P and B860H |
-| **pyamlboot** | https://github.com/superna9999/pyamlboot | Python Amlogic USB recovery tool (has known bugs for secure-boot; useful for research) |
+| `USB/DDR` = `USB/DDR_ENC` | 49,152 | `90d5f0dd` |
+| `USB/UBOOT` = `USB/UBOOT_ENC` | 1,097,728 | `a9343ac6` |
+| `PARTITION/bootloader` (unchanged) | 1,146,880 | `42046269` |
+| `dtb/meson1` (unchanged) | 157,696 | `c8615f43` |
+| `PARTITION/system` (unchanged) | 960,497,712 | `97cfc5b5` |
 
-### Software
+If your `bootloader` hash differs, you have a different firmware build. It might still work, but you're off the tested path.
 
-| Tool | Purpose |
-|---|---|
-| Amlogic USB Burning Tool **v2.x** | The tool that completed the burn — use v2, not v3 |
-| Python 3 + pyusb + capstone | Protocol research and blob disassembly |
-| binwalk | Blob analysis |
-| WSL | Required to run `aml_encrypt_gxl` (Linux binary) |
+### Step 2: Burn
 
-### `aml_encrypt_gxl`
+1. Open USB Burning Tool and **Import** `hg680p_secure.img`.
+2. Tick **Erase flash** and **Erase bootloader**. Leave **Reset after success** and **Overwrite key** unticked.
+3. Box in mask ROM, USB connected, 12 V connected. Press **Start**.
+4. **Expect a few red failures before it works.** On the working run the log shows six failed attempts (USB transfer errors, DDR init and PLL errors) before a clean pass:
+   ```
+   [00:20:43] [0x10103003] Romcode/Initialize DDR/Download buffer/USB transfer error
+   [00:20:53] [0x10105004] Romcode/Initialize DDR/Read initialize status/Error result
+   [00:20:56] [0x10102002] Romcode/Initialize DDR/Initialize PLL/USB Control setup error
+   [00:23:26] [0x00000000] Burning successfully
+   ```
+   If it keeps failing at 1–2%, unplug the box's power for about 5 seconds, plug back in and retry. The 4% pause is normal; don't unplug.
+5. At 100%: click **Stop**, unplug USB, close the tool.
 
-Amlogic's GXL signing tool, included in the 3F repo. Can re-sign BL2 if you have the key package — but the keys are vendor secrets only licensed board makers have. Without them, this tool is not useful for recovery.
+### Step 3: First boot
+
+Power-cycle with HDMI connected and **the USB cable unplugged**. With USB connected, u-boot can drop into USB-burn mode (`InUsbBurn` / `noSof`) instead of booting. The first boot takes **5–10 minutes**.
+
+If you need to burn again later and the tool fails at `[0x00101004] Erase bootloader/Lowper/Identify/Error`, untick **Erase bootloader** (keep **Erase flash**) and retry. That was the workaround used here; the burn went through after it.
 
 ---
 
-## 14. For Developers / Researchers
+## After it boots
 
-### USB protocol in WorldCup mode
+### 1. Close the root telnet shell
 
-1. Host writes PLL control registers: `0xd9000000 ← 0xb1`, `← 0x5183` (×2 each)
-2. Host reads efuse at `0xc8100228` → determines secure vs plain path
-3. **Secure path:** Host uploads `DDR_ENC.USB` (vendor-signed, encrypted)
-4. Host writes run-para (8 words) to scratch window
-5. Host sends "run" command to `0xd9000000` (real code is at `+0x1000`)
-6. ROM initializes DDR using ddrpara from blob
-7. On success: paraMagic in scratch window → `0x7856efab`
-8. Host uploads `UBOOT_ENC.USB` to `0x200c000`
-9. Host sends run command
-10. Device disconnects, re-enumerates as ADFU
-11. Normal partition flashing via ADFU protocol
+From a root shell (see below), check whether port 23 is open:
 
-### @AML container format
-
-```
-0x00  [16 bytes]  SHA2 hash
-0x10  [4 bytes]   "@AML" magic
-0x14  [varies]    Header fields
-...
-0x1000             Executable code begins HERE (not at 0x0)
+```sh
+netstat -ln | grep ':23 '
 ```
 
-The entry point bug (all open-source tools jump to 0x0 = the hash, not 0x1000 = the code) is present in pyamlboot, optimus.py, and likely the Burning Tool on the plain branch. The official tool on the secure-boot branch handles this differently internally.
+If it is, remove the line that starts telnetd from `init.fhservice.sh` (or stop that script from running), then reboot. *This step wasn't done on the test unit. It's a recommendation based on the firmware audit.*
 
-### Genuine run-para (8 words, little-endian)
+### 2. Wireless ADB
+
+The stock `build.prop` already has `service.adb.tcp.port=5555`. On this build, tapping *Build* in Settings may not reveal Developer Options. The reliable route:
+
+1. Sideload **Terminal Emulator for Android** (`jackpal.androidterm`). Current Termux needs Android 7+, so it won't install on this Android 6 build. Install from a USB stick with the built-in file manager or through Aptoide TV.
+2. In the terminal:
+   ```sh
+   su
+   settings put global development_settings_enabled 1
+   settings put global adb_enabled 1
+   setprop service.adb.tcp.port 5555
+   setprop persist.adb.tcp.port 5555
+   stop adbd
+   start adbd
+   ip -f inet addr show wlan0     # or eth0
+   ```
+3. From the PC: `adb connect <box-ip>:5555` and accept the prompt on the TV (`ro.adb.secure=1` on stock).
+
+### 3. Debloat over ADB, not in the image
+
+Editing `/system` inside the burn image caused more problems than it solved: Play Store stuck on "pending", Developer Options missing, broken boot hooks. Debloating a working stock install over ADB was clean:
+
+```sh
+# remove for user 0 (the APKs stay in /system, so a factory reset or reflash brings them back)
+adb shell pm uninstall --user 0 com.atvxperience.webxperience
+adb shell pm uninstall --user 0 com.atvxperience.appdrawer
+adb shell pm uninstall --user 0 com.cmcm.cleanmaster.tv
+adb shell pm uninstall --user 0 iflix.play
+adb shell pm uninstall --user 0 com.player.zaltv
+adb shell pm uninstall --user 0 news.androidtv.tvapprepo.playstore
+adb shell pm uninstall --user 0 com.android.htmlviewer
+adb shell pm uninstall --user 0 com.android.dreams.phototable
+
+# faster UI
+adb shell settings put global window_animation_scale 0.5
+adb shell settings put global transition_animation_scale 0.5
+adb shell settings put global animator_duration_scale 0.5
+```
+
+**Don't remove Google packages** (GMS, GSF, Play Store, Katniss, Backdrop, Leanback). Removing them broke Play Store downloads here.
+
+To use **ATV Launcher** (`ca.dstudio.atvlauncher.free`, works on Android 6) as home, install it, then disable the stock launcher. This Android 6 build has no `pm set-home-activity`:
+
+```sh
+adb shell pm disable-user --user 0 com.google.android.leanbacklauncher
+# undo: adb shell pm enable com.google.android.leanbacklauncher
+```
+
+**Don't** set `debug.composition.type=gpu`. This box uses `c2d`, and forcing GPU composition gave yellow/green moiré corruption on screen.
+
+---
+
+## Why it fails: how the USB burn works
+
+The USB Burning Tool does this, in order:
 
 ```
-3412cdab  ← magic (ROM uses this to find the para in the scratch window)
-00000200  ← size
-0000c0df  ← command
-00000001  ← word3 (DRAM config related)
-00400000  ← word4
-0082c0cc  ← word5
-00000000  ← word6
-00000010  ← word7
+1. identify           → ROM answers 2-4-0-0 (mask ROM / IPL)
+2. read 0xc8100228    → 0xbdfd21bc = secure → switch to *_ENC items
+3. send DDR_ENC.USB   → BL2 to 0xd9000000, run it with a 32-byte para
+4. read para back     → 0x7856efab + ddrCapacity = DDR OK
+                        0x3412cdab (unchanged) = BL2 never ran
+5. send UBOOT_ENC.USB → u-boot to 0x0200c000
+6. re-run BL2         → BL2 verifies/decrypts u-boot and jumps to it
+7. wait for re-enum   → u-boot brings USB back up (TPL, 0-7-0-16)  ← the "4%" step
+8. send dtb/meson1    → this DTB's partition table is the BURN table
+9. for each PARTITION item: "Initialize partition <name>" → write → VERIFY
 ```
 
-The Radxa pyamlboot copy has words 6 and 7 **swapped** (`10000000 00000000` instead of `00000000 00000010`).
+What went wrong at each stage on this unit:
 
-### ddrpara struct at 0x9800
+- **2% (`0x10103005`):** the stock image has no `_ENC` items at all, so the tool logs `Download DDR_ENC.USB,size: 0!`. Early custom images had `_ENC` slots filled with copies of the *plaintext* `@AML` BL2, which the secure ROM refuses.
+- **2% (`0x10105002`, para still `0x3412cdab`):** plaintext or wrong-board BL2s. Of every BL2 tested, only the encrypted one (sha `90d5f0dd…`) ever completed DDR init on this chip. The same blob sits at `0x200` in FarelRA's revive `u-boot.bin` and in the first 48 KiB of the stock `PARTITION/bootloader`.
+- **4% (`0x10303004`):** with the working BL2 plus a u-boot from another source (Aidan's ROM, the factory boot area, the stock `USB/UBOOT` item, FarelRA's raw FIP), DDR passed every time. Then nothing came back:
+  ```
+  runResult:0x 0,paraMagic:0x7856efab   ddrCapacity:0x 800    ← DDR OK
+  Download UBOOT_ENC.USB buffer at 0x0200c000
+  DownCheckPara succeed / DownRunPara succeed
+  Run at address 0xd9000000
+  Detect Device remove timeout                                ← u-boot never starts
+  [0x10303004] Romcode/Switch status/Identify/Error result
+  ```
+  BL2 and u-boot are encrypted/signed as a pair. If the BL2 can't verify the u-boot, the CPU just halts: no error, no USB, no HDMI. Swapping in "the right HG680P u-boot" from somewhere else doesn't help. It has to be **the** u-boot that shipped next to that BL2.
+- **After 4%:** partition names are looked up in the image's `dtb/meson1`. The stock DTB only defines `boot / bootloader / logo / recovery / system` (no `odm`, `vendor`, `product`, `dtbo`, `vbmeta`). That's why porting an Android 9 ROM onto the stock bootloader died at 9–10% with `[0x30402004] UBOOT/Partition odm/Initialize partition/Error result`, however the payload was sized or flagged.
 
-Known-good start bytes (from 3F repo):
-```
-03 02 01 00 01 03 02 00 ...
-```
-Encodes DRAM timing, width, rank count, and capacity. All zeros = DDR init always fails.
+---
 
-### Recovery timeline
+## Error code cheat sheet
 
-| Date/Time | Event |
-|---|---|
-| 2026-10-05 22:07:05 | Bootloader erased by USB Burning Tool; burn failed → box bricked |
-| 2026-10-21 ~11:25 | First DDR init success (`aidan_hazel_final.img` — 3F DDR + stock UBOOT) — DDR passed, U-Boot handoff failed |
-| 2026-10-21 ~12:26 | Second DDR init success (`stockddr_enc_v2`) — confirmed repeatable |
-| 2026-10-21 ~12:29 | `ATV FW HG680P.img` (stock HG680P firmware) opened — correct UBOOT_ENC.USB source identified |
-| 2026-10-22 20:55–20:57 | USB transport failures (`ret=-116`/`ret=-5`) from Parsec — fixed by power cycle + direct USB |
-| 2026-10-22 (late) | Full burn completed |
-| 2026-10-22 (late) | Box booted Android TV. ADB accessible. ✅ |
+From this unit's logs, tool v2.1.6.8.
 
-### Verified image checksums (sha256 prefix)
-
-| Image | DDR_ENC.USB | UBOOT_ENC.USB |
+| Code | Text | Meaning here |
 |---|---|---|
-| `aidan_hazel_finalboot_v2.img` | `90d5f0dd...` | `a59cd538...` |
-| `aidan_hazel_final.img` | `90d5f0dd...` | `8d4927e7...` |
-
-`bootarea_before.bin` (pre-brick 4 MiB boot area, md5 `9c9362c0507e1cb2bcf383b83ec83ba0`) is the gold standard for a factory-state restore.
-
-### Research scripts
-
-| Script | Purpose |
-|---|---|
-| `ddr_read.py` | Read back para from scratch window |
-| `ddr_sweep.py` | Sweep multiple para shapes and run addresses |
-| `ddr_monitor.py` | Continuously poll for paraMagic change |
-| `rawdisk.py` | Raw SD card read/write helper |
-| `sd_write_layoutB.py` | Write SD card with correct S905X offset (0x200) |
-| `build_fullboot.py` | Assemble full 4 MiB boot area from parts |
-| `sd_restore_mbr.py` | Restore MBR after accidental overwrite |
+| `0x10103005` | `Romcode/Initialize DDR/Download buffer/Read item data failed` | `DDR_ENC` item missing or empty (secure chip, stock image). Also caused by an image builder that zeroed item descriptors. |
+| `0x10105002` | `Romcode/Initialize DDR/Read initialize status/USB Control setup error` (`ReadPara failed`) | BL2 rejected; para still reads `0x3412cdab` |
+| `0x10103003` | `Romcode/Initialize DDR/Download buffer/USB transfer error` | USB link flake. Power-cycle and retry. |
+| `0x10101002` | `Romcode/Initialize DDR/Identify/USB Control setup error` | Device wedged, often by another program holding it. Close it and power-cycle. |
+| `0x10303004` | `Romcode/Switch status/Identify/Error result` | **The 4% wall.** BL2/u-boot pair mismatch. |
+| `0x30402004` | `UBOOT/Partition <name>/Initialize partition/Error result` | `<name>` not in the image's `dtb/meson1` partition table |
+| `0x30403003` | `UBOOT/Partition system/Download buffer/Data tranfer error` | Raw 1 GiB system image; repack it as a sparse image |
+| `0x30405004` | `UBOOT/Partition system/Verify patition/Error result` (at 98%) | `VERIFY/<name>` must be `sha1sum <sha1 of the payload as stored>`, i.e. of the **sparse** file, not the expanded image |
+| `0x00101004` | `Erase bootloader/Lowper/Identify/Error result` | Seen when re-burning a box that already boots. Untick *Erase bootloader*. |
 
 ---
 
-## Appendix: Quick Reference Error Codes
+## Bonus: get Armbian/SSH back with a dead eMMC
 
-| Code / Value | Meaning |
+This isn't needed for the fix above, but it's how this unit stayed accessible while the eMMC bootloader was dead. It's based on FarelRA's *Revive Dead eMMC / Corrupt Bootloader* method.
+
+On an Armbian SD card:
+
+| Location | Content |
 |---|---|
-| Stage `2-4-0-0` | WorldCup / IPL mode — mask ROM waiting for USB DDR blob |
-| `0x10103005` | Read item data failed — `DDR_ENC.USB` not found in image |
-| `0x10103003` | **Two meanings:** (1) `Need_Write=4096, Actual_Write=0` = USB transport failure (Parsec/bad cable — power cycle + replug); (2) plain DDR path rejected by secure-boot ROM after blob transfer |
-| `0x10105002` | ReadPara failed — DDR init failed, usually bad ddrpara at 0x9800 |
-| `0x10303004` | Switch status/Identify/Error — U-Boot never came up, ADFU timeout |
-| `0x7856efab` (paraMagic) | ✅ **DDR init SUCCESS** |
-| `0x3412cdab` (paraMagic) | Initial magic sent by host — ROM hasn't responded yet |
-| `0xbdfd21bc` (efuse) | Secure boot enabled (bit 0x10 set) |
+| Sector 0 | **Keep the original MBR** (`55 AA`). Writing a bootloader at offset 0 destroys it, and that's why the first SD attempt failed. |
+| Offset `0x200` (sector 1) | FarelRA's `revive-dead-emmc-bootloader/u-boot.bin`, copied from its `0x200` onward. The ROM accepts it because its BL2 is the vendor-encrypted one. |
+| FAT `aml_autoscript` | FarelRA's 173-byte script: `if printenv bootfromsd; then exit; fi; if fatload mmc 0 0x1000000 u-boot.ext; then go 0x1000000; fi;` |
+| FAT `u-boot.ext` | Mainline p212 u-boot (`u-boot-p212.bin` from the Armbian image) |
+| FAT `extlinux/extlinux.conf` | Enabled, `fdt /dtb/amlogic/meson-gxl-s905x-p212.dtb` |
+
+Boot with the card in → mask ROM loads the SD's hidden-sector u-boot → `aml_autoscript` → mainline u-boot → Armbian → SSH. From there the eMMC (`/dev/mmcblk2`) can be read and written with `dd`.
+
+**Caveats seen here:**
+- Once the eMMC has a *valid-looking* bootloader again, the ROM prefers it over the SD. A half-written eMMC boot area blocks SD fallback completely, while a fully blank one does not.
+- **Back up the first 4 MiB of eMMC before you touch anything:**
+  `dd if=/dev/mmcblk2 of=bootarea_before.bin bs=1M count=4`
+- On secure units, writing the factory 4 MiB boot area back from Armbian did **not** make Android boot here (black screen, with various layouts and with `mmc bootpart` / `PARTITION_CONFIG` set to `0x00` and `0x10`). The USB burn above is what actually fixed it.
 
 ---
 
-## Acknowledgements
+## What was tried and ruled out
 
-Technical research, protocol sweeps, and recovery work by **Hazel** (2026-10).
+| Approach | Result |
+|---|---|
+| **Manual DDR init with pyamlboot / `optimus.py`** | Dead end. About 40 combinations of 3 BL2s × para shapes (6-word vs the 8-word GXL para) × 8 run addresses (incl. `+0x1000` past the `@AML` header) × para placement/order × 32 B vs `0x200` writes. Never got the `0x7856efab` ack. The official tool with the right encrypted BL2 runs it at `0xd9000000` with no tricks, so the `+0x1000` theory only applies to plaintext containers. |
+| **Patching the `ddrpara` struct at `0x9800` in the DDR blob** (idea from 3F/aml_s905_uboot) | Investigated: the Aidan blob has a build string (`xl 3e531ea - luan.yuan`) there, the stock blob has zeros. **Not the fix.** DDR init only started working once the *encrypted* BL2 went into `DDR_ENC`. |
+| **Re-signing u-boot with `aml_encrypt_gxl`** | Not possible without vendor keys (`--keysig` rc=104, `--bootsig` rc=25, self-generated keys don't match the fused root key) |
+| **3F/aml_s905_uboot reference 2G pair** | That repo is **GXB (S905)**, not GXL (S905X). Wrong SoC. |
+| **Aidan's ROM v9 (ATV9) bootloader** | Its boot chain is non-secure `@AML`/AMLC, so the secure ROM rejects it |
+| **Aidan ATV9 system on the stock secure bootloader** (via USB tool) | Burn dies at 9–10%: stock DTB has no `dtbo`/`odm`/`vendor`/`product`. Resizing payloads or changing the sparse flag doesn't help (it's a name lookup). |
+| **Aidan ATV9 on the stock bootloader** (raw eMMC writes, boot header v1→v0, `root=p14`) | No HDMI signal. A 22-entry MPT keeping stock `boot`/`system` offsets was designed but **never tested**. |
+| **Writing the boot area directly to eMMC from Armbian** (factory dump, raw `+0x200` layout, `aml_sdc_burn` item, `mmcblk2boot0/1`) | No HDMI signal on this unit |
+| **Old tool version (v2.1.6 / 2.0.7.2)** | Same `DDR_ENC` logic as v2.1.6.8 and v2.2.0 |
+| **eMMC CLK-to-GND short** | Suggested, never needed |
+| **Baking debloat/ADB/launcher into `/system` of the burn image** | Burns fine once the system image is sparse and VERIFY matches, but caused Play Store "pending", missing Developer Options, and a non-executable (`0644`) boot hook. Debloating over ADB afterwards was cleaner. |
 
-If this helped you, please contribute your findings back — especially if you have a different S905X variant that required different files, or if you can confirm a specific 3F repo commit hash that carries the correct ddrpara.
+---
 
-If something here is wrong or outdated, open an issue or PR.
+## How this unit got bricked
+
+1. The box was running Armbian from SD (chain-loaded by the eMMC's factory u-boot).
+2. A custom Android ROM (Aidan's ROM v9, sanitized, with a custom splash) was written partition-by-partition to the eMMC over SSH. It bootlooped, because the burn flow also writes the u-boot env and `param`, which a raw write skips.
+3. **2026-10-20, around 05:49 WIB:** the USB Burning Tool was run with **Erase bootloader** ticked. The log shows `ERASE BOOTLOADER → Erase command success`. That wiped the first 4 MiB of eMMC. The burn then failed at DDR init (secure chip, no valid `DDR_ENC`), so the bootloader was never rewritten. Result: mask ROM, black screen.
+4. A partial bootloader write afterwards left a "valid header, broken image", which also blocked the SD fallback. Restoring the full factory 4 MiB from a backup fixed SD booting.
+
+**Takeaway:** on a secure HG680P, **Erase bootloader** + an image whose `_ENC` items don't match = instant brick. Check that your image passes the 4% step before you trust it with an erase.
+
+---
+
+## Resources & credits
+
+- **FarelRA**: [HG680P-B860H-Files](https://github.com/FarelRA/HG680P-B860H-Files) (`revive-dead-emmc-bootloader/u-boot.bin`) and the [revive gist](https://gist.github.com/FarelRA/2d5bc9e23d2e718f1f30247b74638c32). This was the source of the encrypted BL2 that first passed DDR, and of the SD revive method.
+- [3F/aml_s905_uboot](https://github.com/3F/aml_s905_uboot): GXL para docs and `aml_encrypt_gxl` (GXB images, so not directly usable on S905X)
+- [assegaf/stb-905x-indonesia](https://github.com/assegaf/stb-905x-indonesia): real HG680P UART boot log (`gxl_p212_v1`, `InUsbBurn`, env at `0x27400000`)
+- [repk/gxlimg](https://github.com/repk/gxlimg), [Raxone/amlogic-usbdl_s905_s905x_s905w](https://github.com/Raxone/amlogic-usbdl_s905_s905x_s905w): GXL image tooling and secure-world dumping (not needed for this fix)
+- [ophub/amlogic-s9xxx-armbian #262](https://github.com/ophub/amlogic-s9xxx-armbian/issues/262): Armbian-on-eMMC (not Android)
+- [superna9999/pyamlboot](https://github.com/superna9999/pyamlboot): `AmlImagePack` was used to inspect images
+- Aidan's ROM v9 (XDA): source of the custom ROM attempts
+
+Debugging was done across about 2,000 messages with AI coding agents. Every claim here was checked against the actual USB Burning Tool and SSH logs from those sessions.
+
+## Disclaimer
+
+This worked on one unit, with one firmware build. If your box has no bootloader at all (blank first 4 MiB, sitting in WorldCup mode), a failed attempt mostly just leaves you where you started. The real risk is a **half-written or mismatched** bootloader: the ROM accepts the header, loads it, and hangs. Then the box doesn't drop back to WorldCup or SD boot, and you've lost both easy recovery paths. That happened during this recovery. Back up the first 4 MiB if you can, and don't hand-write bootloader blobs to the eMMC unless you know they match your chip. No firmware is distributed here. Use at your own risk.
