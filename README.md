@@ -7,9 +7,11 @@
 
 Recovery guide for the **Fiberhome HG680P** (IndiHome STB, Amlogic **S905X / GXL**, 2 GB) when it's stuck in **mask ROM / "WorldCup Device"** mode, and the Amlogic USB Burning Tool keeps failing at **1–2%** (DDR init) or **4%** (u-boot hand-off).
 
+> 📖 **Want the byte-level forensic record?** See [`HG680P-unbrick-secure-boot.md`](HG680P-unbrick-secure-boot.md) — full AML image format spec, a verified item-by-item table of the working image with offsets and full sha256, `conf/platform` and boot-blob anatomy, corrected commands, and a line-by-line verification appendix. Also note: [`make_secure_image.py`](make_secure_image.py) was rewritten to be dependency-free and is verified to reproduce the working image **bit-for-bit** (sha256 `2eb1eff884f1849f63b95eb5acefd1bc2d387f19fc451dadee5ebb405f6ea5ea`).
+
 The usual "load the .img into USB Burning Tool and press Start" guides don't work on units with **secure boot fused on**. This repo explains why and gives a fix that works: **a one-script patch to the stock firmware image**. You don't need vendor keys, UART or a soldering iron.
 
-> **Status:** ✅ Recovered on a real unit (bricked 2026-10-20, burned to 100% on 2026-10-23 at 00:23 WIB).
+> **Status:** ✅ Recovered on a real unit (bootloader erased mid-burn on 2026-10-05 at 22:07:05 after an *Erase bootloader* burn; repair verified 2026-10-20…23; burned to 100% on 2026-10-23 at 00:23 WIB).
 > Tested on **one** HG680P. Other units, or other S905X boxes, may differ. Read the whole thing before you burn anything.
 
 ---
@@ -86,9 +88,9 @@ The tool's logs are in:
 
 ### What you need
 
-- Windows PC with **Amlogic USB Burning Tool v2.1.6.8** (the version in the *"ATV FW HG680P USB Burning V2.1"* package). v2.1.6 and v2.2.0 use the same secure-boot logic, so the tool version doesn't fix this.
+- Windows PC with **Amlogic USB Burning Tool** (the logs on this unit show **V2.1.9.0**; other versions in the 2.x line, e.g. V2.1.6.8 in the *"ATV FW HG680P USB Burning V2.1"* package, use the same secure-boot logic, so the tool version doesn't fix this).
 - The stock firmware **`ATV FW HG680P.img`**, from the same *"ATV FW HG680P USB Burning V2.1"* package. This repo does not host firmware.
-- Python 3 (standard library only).
+- Python 3 (standard library only — `make_secure_image.py` parses the AML image format itself; no pip installs).
 - USB A-to-A cable to the box's OTG port, plus the **12 V DC adapter**.
 
 > ⚠️ **About the stock firmware:** it is pre-rooted, and an init script (`init.fhservice.sh`) starts an **unauthenticated root telnet shell on port 23** (`busybox telnetd -l /system/bin/sh &`). It also includes FTP/TFTP/telemetry-upload scripts. It contains no malware as such, but anyone on your LAN can get a root shell. See [After it boots](#after-it-boots) to close it.
@@ -96,16 +98,18 @@ The tool's logs are in:
 ### Step 1: Build the patched image
 
 ```bash
-python make_secure_image.py "ATV FW HG680P.img" hg680p_secure.img
+python make_secure_image.py --src "ATV FW HG680P.img" --out hg680p_secure.img
 ```
+
+The script parses the AML image, pulls the encrypted 49,152-byte BL2 from the stock image's `PARTITION/bootloader` (first 49,152 bytes; the u-boot it ships is the rest of the item) and installs it as `USB/DDR`/`USB/DDR_ENC`, keeps stock `USB/UBOOT` as the matching u-boot (`USB/UBOOT_ENC` mirror), appends the missing `_ENC` descriptors and recomputes the item count, image size and header CRC-32. No other inputs needed. To override the BL2 (e.g. with FarelRA's revive binary), use `--bl2 <file>` (must be exactly 49,152 bytes).
 
 Optional: add a custom boot splash (raw Amlogic logo partition blob). `VERIFY/logo` is regenerated for you:
 
 ```bash
-python make_secure_image.py "ATV FW HG680P.img" hg680p_secure.img --logo my_logo.bin
+python make_secure_image.py --src "ATV FW HG680P.img" --out hg680p_secure.img --logo my_logo.bin
 ```
 
-Expected output: 16 items in, **18 items out**. `USB/DDR` and `USB/DDR_ENC` should both be the same 49,152-byte blob, and `USB/UBOOT` and `USB/UBOOT_ENC` the same 1,097,728-byte blob.
+Expected output: 16 items in, **18 items out** (`appended USB/DDR_ENC`, `appended USB/UBOOT_ENC`). `USB/DDR` and `USB/DDR_ENC` should both be the same 49,152-byte blob, and `USB/UBOOT` and `USB/UBOOT_ENC` the same 1,097,728-byte blob. The script prints every item's sha256 at the end; rebuilding this repo's reference image reproduces it bit-for-bit (sha256 `2eb1eff884f1849f63b95eb5acefd1bc2d387f19fc451dadee5ebb405f6ea5ea`).
 
 Reference values from the working build:
 
@@ -243,7 +247,7 @@ What went wrong at each stage on this unit:
 
 ## Error code cheat sheet
 
-From this unit's logs, tool v2.1.6.8.
+From this unit's logs (tool V2.1.9.0; V2.1.6.8 shows the same codes).
 
 | Code | Text | Meaning here |
 |---|---|---|
@@ -295,7 +299,7 @@ Boot with the card in → mask ROM loads the SD's hidden-sector u-boot → `aml_
 | **Aidan ATV9 system on the stock secure bootloader** (via USB tool) | Burn dies at 9–10%: stock DTB has no `dtbo`/`odm`/`vendor`/`product`. Resizing payloads or changing the sparse flag doesn't help (it's a name lookup). |
 | **Aidan ATV9 on the stock bootloader** (raw eMMC writes, boot header v1→v0, `root=p14`) | No HDMI signal. A 22-entry MPT keeping stock `boot`/`system` offsets was designed but **never tested**. |
 | **Writing the boot area directly to eMMC from Armbian** (factory dump, raw `+0x200` layout, `aml_sdc_burn` item, `mmcblk2boot0/1`) | No HDMI signal on this unit |
-| **Old tool version (v2.1.6 / 2.0.7.2)** | Same `DDR_ENC` logic as v2.1.6.8 and v2.2.0 |
+| **Old tool version (v2.1.6 / 2.0.7.2)** | Same `DDR_ENC` logic as v2.1.9.0 and v2.2.0 |
 | **eMMC CLK-to-GND short** | Suggested, never needed |
 | **Baking debloat/ADB/launcher into `/system` of the burn image** | Burns fine once the system image is sparse and VERIFY matches, but caused Play Store "pending", missing Developer Options, and a non-executable (`0644`) boot hook. Debloating over ADB afterwards was cleaner. |
 
@@ -305,7 +309,7 @@ Boot with the card in → mask ROM loads the SD's hidden-sector u-boot → `aml_
 
 1. The box was running Armbian from SD (chain-loaded by the eMMC's factory u-boot).
 2. A custom Android ROM (Aidan's ROM v9, sanitized, with a custom splash) was written partition-by-partition to the eMMC over SSH. It bootlooped, because the burn flow also writes the u-boot env and `param`, which a raw write skips.
-3. **2026-10-20, around 05:49 WIB:** the USB Burning Tool was run with **Erase bootloader** ticked. The log shows `ERASE BOOTLOADER → Erase command success`. That wiped the first 4 MiB of eMMC. The burn then failed at DDR init (secure chip, no valid `DDR_ENC`), so the bootloader was never rewritten. Result: mask ROM, black screen.
+3. **2026-10-05, 22:07:05 WIB:** the USB Burning Tool was run with **Erase bootloader** ticked. The burn log shows `ERASE BOOTLOADER → Erase command success` and `OpenImg …aidan…img` in the same minute; the burn then failed at DDR init (`Upload encrypt at 0xc8100228` / `Read encrypt int Uboot failed!`), so the bootloader was never rewritten. Result: mask ROM, black screen. (A previous version of this README attributed this erase to 2026-10-20 05:49 — that conflicts with the preserved 22:07:05 log capture; 2026-10-20 was the repair session, when the secure-boot path was identified and `DDR_ENC,size: 0!` was first seen.)
 4. A partial bootloader write afterwards left a "valid header, broken image", which also blocked the SD fallback. Restoring the full factory 4 MiB from a backup fixed SD booting.
 
 **Takeaway:** on a secure HG680P, **Erase bootloader** + an image whose `_ENC` items don't match = instant brick. Check that your image passes the 4% step before you trust it with an erase.
